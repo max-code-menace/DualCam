@@ -1,0 +1,25 @@
+{
+  "expo": {
+    "name": "DualCam",
+    "slug": "dualcam",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "platforms": [
+      "ios"
+    ],
+    "ios": {
+      "bundleIdentifier": "com.CHANGEMOI.dualcam",
+      "supportsTablet": false,
+      "infoPlist": {
+        "NSCameraUsageDescription": "DualCam utilise la caméra avant et la caméra arrière en même temps pour prendre une photo double.",
+        "NSPhotoLibraryAddUsageDescription": "DualCam enregistre vos photos doubles dans votre pellicule.",
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    },
+    "plugins": [
+      "expo-dev-client"
+    ]
+  }
+}
