@@ -10,16 +10,24 @@
       "ios"
     ],
     "ios": {
-      "bundleIdentifier": "com.CHANGEMOI.dualcam",
+      "bundleIdentifier": "com.maxcodemenace.dualcam",
       "supportsTablet": false,
       "infoPlist": {
         "NSCameraUsageDescription": "DualCam utilise la caméra avant et la caméra arrière en même temps pour prendre une photo double.",
         "NSPhotoLibraryAddUsageDescription": "DualCam enregistre vos photos doubles dans votre pellicule.",
-        "ITSAppUsesNonExemptEncryption": false
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSMicrophoneUsageDescription": "DualCam utilise le micro pour enregistrer le son de vos vidéos."
       }
     },
     "plugins": [
-      "expo-dev-client"
-    ]
+      "expo-dev-client",
+      "expo-font"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "d6b83d39-d12d-4ad7-aa64-8a991b84215a"
+      }
+    },
+    "owner": "max-code-menace"
   }
 }
