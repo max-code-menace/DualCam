@@ -176,27 +176,62 @@ final class DualCameraController: NSObject {
   private var nightOn = false
   private var nightSeconds = 0
 
-  /// Appelé (thread principal) si iOS arrête la caméra à cause d'une erreur.
+  /// Appelé (thread principal) si iOS arrête la caméra : message à afficher.
   var onRuntimeError: ((String) -> Void)?
+  /// Appelé (thread principal) quand la caméra peut repartir (fin d'interruption, services média relancés).
+  var onResume: (() -> Void)?
 
   private override init() {
     super.init()
     NotificationCenter.default.addObserver(
       forName: AVCaptureSession.runtimeErrorNotification, object: nil, queue: .main
     ) { [weak self] note in
-      let error = note.userInfo?[AVCaptureSessionErrorKey] as? NSError
-      self?.onRuntimeError?(error?.localizedDescription ?? "erreur inconnue.")
+      let error = note.userInfo?[AVCaptureSessionErrorKey] as? AVError
+      // Les services média d'iOS ont redémarré : on relance simplement la caméra.
+      if error?.code == .mediaServicesWereReset {
+        self?.onResume?()
+        return
+      }
+      self?.onRuntimeError?("La caméra s'est arrêtée : \(error?.localizedDescription ?? "erreur inconnue.")")
     }
     NotificationCenter.default.addObserver(
       forName: AVCaptureSession.wasInterruptedNotification, object: nil, queue: .main
     ) { [weak self] note in
       let reason = (note.userInfo?[AVCaptureSessionInterruptionReasonKey] as? NSNumber)?.intValue ?? 0
-      // 1 = app en arrière-plan : normal, on ne dit rien.
-      if reason != 1 {
-        self?.onRuntimeError?("iOS a interrompu la caméra (raison \(reason)).")
+      if let message = DualCameraController.interruptionMessage(reason) {
+        self?.onRuntimeError?(message)
       }
     }
+    NotificationCenter.default.addObserver(
+      forName: AVCaptureSession.interruptionEndedNotification, object: nil, queue: .main
+    ) { [weak self] _ in
+      self?.onResume?()
+    }
+    // Fichiers temporaires laissés par une session précédente (miniatures, vidéos non enregistrées).
+    sessionQueue.async { DualCameraController.removeOldTemporaryFiles() }
     startNightWatch()
+  }
+
+  /// Message affiché quand iOS met la caméra en pause (nil = rien à dire).
+  private static func interruptionMessage(_ reason: Int) -> String? {
+    switch reason {
+    case 1: return nil  // app en arrière-plan : normal
+    case 2: return "Le micro est utilisé par une autre app (un appel ?). La vidéo reprendra ensuite."
+    case 3: return "La caméra est utilisée par une autre app."
+    case 4: return "La caméra n'est pas disponible quand plusieurs apps sont ouvertes à l'écran."
+    case 5: return "L'iPhone est trop chaud : la caméra fait une pause."
+    default: return "La caméra est momentanément indisponible."
+    }
+  }
+
+  static func removeOldTemporaryFiles() {
+    let directory = FileManager.default.temporaryDirectory
+    guard let files = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else {
+      return
+    }
+    for file in files where file.lastPathComponent.hasPrefix("dualcam-") {
+      try? FileManager.default.removeItem(at: file)
+    }
   }
 
   // Mode Duo
@@ -211,8 +246,14 @@ final class DualCameraController: NSObject {
   }
   private let backPhotoOutput = AVCapturePhotoOutput()
   private let frontPhotoOutput = AVCapturePhotoOutput()
-  private(set) var backDevice: AVCaptureDevice?
-  private(set) var frontDevice: AVCaptureDevice?
+  private(set) var backDevice: AVCaptureDevice? {
+    get { locked { _backDevice } }
+    set { locked { _backDevice = newValue } }
+  }
+  private(set) var frontDevice: AVCaptureDevice? {
+    get { locked { _frontDevice } }
+    set { locked { _frontDevice = newValue } }
+  }
   private var dualConfigured = false
 
   // Modes Photo / Vidéo
@@ -221,12 +262,33 @@ final class DualCameraController: NSObject {
   private let movieOutput = AVCaptureMovieFileOutput()
   private var singleInput: AVCaptureDeviceInput?
   private var audioInput: AVCaptureDeviceInput?
-  private(set) var singleDevice: AVCaptureDevice?
+  private(set) var singleDevice: AVCaptureDevice? {
+    get { locked { _singleDevice } }
+    set { locked { _singleDevice = newValue } }
+  }
   private var rotationCoordinator: AnyObject?
 
-  private(set) var mode: CaptureMode?
-  private var inFlightDelegates: [NSObject] = []
+  // Lu depuis le fil principal (zoom, mise au point) et écrit par la file de la caméra.
+  private let stateLock = NSLock()
+  private var _mode: CaptureMode?
+  private var _backDevice: AVCaptureDevice?
+  private var _frontDevice: AVCaptureDevice?
+  private var _singleDevice: AVCaptureDevice?
+  private func locked<T>(_ body: () -> T) -> T {
+    stateLock.lock()
+    defer { stateLock.unlock() }
+    return body()
+  }
+
+  private(set) var mode: CaptureMode? {
+    get { locked { _mode } }
+    set { locked { _mode = newValue } }
+  }
+  private var inFlightDelegates: [ObjectIdentifier: NSObject] = [:]
+  /// true pendant une photo Duo ou une photo en mode nuit (une seule à la fois).
   private var isCapturing = false
+  /// Photos simples en cours (on peut en enchaîner plusieurs, comme l'app Appareil photo).
+  private var singleInFlight = 0
   private var movieDelegate: MovieRecordingDelegate?
   private var pendingStop: ((Result<CaptureResult, Error>) -> Void)?
   private var subjectObservers: [NSObjectProtocol] = []
@@ -322,25 +384,6 @@ final class DualCameraController: NSObject {
       if let multi = self.multiSessionStorage, multi.isRunning { multi.stopRunning() }
       if self.singleSession.isRunning { self.singleSession.stopRunning() }
     }
-  }
-
-  /// Résumé technique affiché à l'écran pendant la mise au point de l'app.
-  func debugState() -> String {
-    let single = singleSession
-    var parts = ["run=\(single.isRunning ? 1 : 0)", "int=\(single.isInterrupted ? 1 : 0)",
-                 "in=\(single.inputs.count)", "out=\(single.outputs.count)",
-                 "duo=\(multiSessionStorage == nil ? 0 : 1)"]
-    if let device = singleDevice {
-      let dims = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
-      parts.append("fmt=\(dims.width)x\(dims.height)")
-      parts.append("z=\(device.videoZoomFactor)")
-    }
-    if let connection = singlePhotoOutput.connection(with: .video) {
-      parts.append("pc=\(connection.isActive ? 1 : 0)\(connection.isEnabled ? 1 : 0)")
-    } else {
-      parts.append("pc=nil")
-    }
-    return parts.joined(separator: " ")
   }
 
   /// Infos utiles à l'écran (zoom, flash, Live, résolutions…).
@@ -648,6 +691,22 @@ final class DualCameraController: NSObject {
     if let biggest = device.activeFormat.supportedMaxPhotoDimensions.max(by: { area($0) < area($1) }) {
       singlePhotoOutput.maxPhotoDimensions = biggest
     }
+    // Ultra grand-angle (0,5×) : iOS redresse les bords déformés, comme l'app Appareil photo.
+    if singlePhotoOutput.isContentAwareDistortionCorrectionSupported {
+      singlePhotoOutput.isContentAwareDistortionCorrectionEnabled = true
+    }
+    // Déclenchement instantané, et photos enchaînées sans attendre la précédente.
+    if #available(iOS 17.0, *) {
+      if singlePhotoOutput.isZeroShutterLagSupported {
+        singlePhotoOutput.isZeroShutterLagEnabled = true
+      }
+      if singlePhotoOutput.isResponsiveCaptureSupported {
+        singlePhotoOutput.isResponsiveCaptureEnabled = true
+      }
+      if singlePhotoOutput.isFastCapturePrioritizationSupported {
+        singlePhotoOutput.isFastCapturePrioritizationEnabled = true
+      }
+    }
 
     // Portrait + miroir pour la caméra avant (comme l'app Appareil photo)
     for output in [singlePhotoOutput, movieOutput] as [AVCaptureOutput] where session.outputs.contains(output) {
@@ -657,8 +716,13 @@ final class DualCameraController: NSObject {
         connection.automaticallyAdjustsVideoMirroring = false
         connection.isVideoMirrored = side == .front
       }
-      if output === movieOutput && connection.isVideoStabilizationSupported {
-        connection.preferredVideoStabilizationMode = .auto
+      if output === movieOutput {
+        if connection.isVideoStabilizationSupported {
+          connection.preferredVideoStabilizationMode = .auto
+        }
+        if movieOutput.availableVideoCodecTypes.contains(.hevc) {
+          movieOutput.setOutputSettings([AVVideoCodecKey: AVVideoCodecType.hevc], for: connection)
+        }
       }
     }
   }
@@ -704,8 +768,8 @@ final class DualCameraController: NSObject {
   }
 
   private func checkLowLight() {
-    // Pendant une photo, la caméra est en pose manuelle : on ne mesure rien.
-    if isCapturing { return }
+    // Pendant une photo, la caméra peut être en pose manuelle : on ne mesure rien.
+    if isCapturing || singleInFlight > 0 { return }
     var on = false
     var seconds = 0
     if case .photo(let side)? = mode, side == .back, let device = singleDevice,
@@ -981,6 +1045,11 @@ final class DualCameraController: NSObject {
         self.takeDualPhoto(flash: request.flash, composition: composition, completion: completion)
       case .photo:
         guard self.singleSession.isRunning else { completion(.failure(DualCameraError.notRunning)); return }
+        // Au-delà de trois photos en attente, on laisse l'iPhone finir.
+        guard self.singleInFlight < 3 else {
+          completion(.failure(DualCameraError.captureFailed("une photo est déjà en cours.")))
+          return
+        }
         self.takeSinglePhoto(request, completion: completion)
       case .video:
         completion(.failure(DualCameraError.captureFailed("passez en mode Photo.")))
@@ -1019,7 +1088,9 @@ final class DualCameraController: NSObject {
       }
     }
 
-    isCapturing = true
+    let night = request.nightPrepared
+    if night { isCapturing = true }
+    singleInFlight += 1
     let output = singlePhotoOutput
 
     let useHeif = request.heif && output.availablePhotoCodecTypes.contains(.hevc)
@@ -1030,6 +1101,9 @@ final class DualCameraController: NSObject {
       settings.flashMode = request.flash
     }
     settings.photoQualityPrioritization = .quality
+    if output.isContentAwareDistortionCorrectionEnabled {
+      settings.isAutoContentAwareDistortionCorrectionEnabled = true
+    }
     if let dims = photoDimensions(megapixels: request.megapixels) {
       settings.maxPhotoDimensions = dims
     }
@@ -1040,15 +1114,24 @@ final class DualCameraController: NSObject {
     }
     applyCaptureRotation(to: output.connection(with: .video))
 
+    // Tout ce qui suit s'exécute sur la file de la caméra.
     var finished = false
+    var key: ObjectIdentifier?
+    let done: () -> Void = { [weak self] in
+      guard let self = self else { return }
+      if let key = key { self.inFlightDelegates.removeValue(forKey: key) }
+      self.singleInFlight = max(0, self.singleInFlight - 1)
+      if night {
+        self.restoreAutoExposure()
+        self.isCapturing = false
+      }
+    }
     let delegate = SinglePhotoDelegate { [weak self] result in
       guard let self = self else { return }
       self.sessionQueue.async {
         guard !finished else { return }
         finished = true
-        self.inFlightDelegates.removeAll()
-        if request.nightPrepared { self.restoreAutoExposure() }
-        self.isCapturing = false
+        done()
         switch result {
         case .failure(let error):
           completion(.failure(DualCameraError.captureFailed(error.localizedDescription)))
@@ -1058,17 +1141,17 @@ final class DualCameraController: NSObject {
         }
       }
     }
-    inFlightDelegates.append(delegate)
+    let identifier = ObjectIdentifier(delegate)
+    key = identifier
+    inFlightDelegates[identifier] = delegate
     output.capturePhoto(with: settings, delegate: delegate)
 
-    sessionQueue.asyncAfter(deadline: .now() + 12) { [weak self] in
-      guard let self = self, !finished else { return }
+    // Sécurité : si l'iPhone ne renvoie jamais la photo, on le dit au lieu d'attendre pour toujours.
+    sessionQueue.asyncAfter(deadline: .now() + 15) {
+      guard !finished else { return }
       finished = true
-      self.inFlightDelegates.removeAll()
-      if request.nightPrepared { self.restoreAutoExposure() }
-      self.isCapturing = false
-      completion(.failure(DualCameraError.captureFailed(
-        "la caméra n'envoie aucune image. [\(self.debugState())]")))
+      done()
+      completion(.failure(DualCameraError.captureFailed("l'appareil photo n'a renvoyé aucune image.")))
     }
   }
 
@@ -1136,7 +1219,7 @@ final class DualCameraController: NSObject {
         lock.unlock()
         group.leave()
       }
-      inFlightDelegates.append(delegate)
+      inFlightDelegates[ObjectIdentifier(delegate)] = delegate
       output.capturePhoto(with: settings, delegate: delegate)
     }
 

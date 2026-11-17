@@ -46,8 +46,6 @@ export type CameraReadyEvent = {
   maxZoom: number;
   minBias: number;
   maxBias: number;
-  /** Relevé technique (diagnostic). */
-  debug?: string;
   /** Mode Vidéo : choix possibles (HD / 4K et images par seconde). */
   videoOptions?: VideoOption[];
   videoResolution?: VideoResolution;
@@ -81,7 +79,5 @@ export type DualCameraViewProps = {
   steady?: boolean;
   /** Il fait sombre : le mode nuit est conseillé, avec la durée de pose. */
   onLowLight?: (event: { nativeEvent: { active: boolean; seconds: number } }) => void;
-  /** Relevé technique (diagnostic). */
-  onDebug?: (event: { nativeEvent: { text: string } }) => void;
   style?: StyleProp<ViewStyle>;
 };

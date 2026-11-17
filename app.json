@@ -13,7 +13,7 @@
       "bundleIdentifier": "com.maxcodemenace.dualcam",
       "supportsTablet": false,
       "infoPlist": {
-        "NSCameraUsageDescription": "DualCam utilise la caméra avant et la caméra arrière en même temps pour prendre une photo double.",
+        "NSCameraUsageDescription": "DualCam utilise la caméra pour prendre vos photos et vos vidéos, y compris avec les deux caméras en même temps.",
         "NSPhotoLibraryAddUsageDescription": "DualCam enregistre vos photos doubles dans votre pellicule.",
         "ITSAppUsesNonExemptEncryption": false,
         "NSMicrophoneUsageDescription": "DualCam utilise le micro pour enregistrer le son de vos vidéos."

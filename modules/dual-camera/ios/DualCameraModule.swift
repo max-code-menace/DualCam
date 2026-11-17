@@ -122,7 +122,7 @@ public class DualCameraModule: Module {
 
     View(DualCameraView.self) {
       Events("onCameraReady", "onCameraError", "onZoomChange", "onSwipe", "onShutterButton", "onExposureChange",
-             "onOrientationChange", "onDebug", "onLowLight")
+             "onOrientationChange", "onLowLight")
 
       Prop("mode") { (view: DualCameraView, mode: String) in
         view.mode = mode

@@ -757,7 +757,7 @@ function CameraScreen() {
           }}
           steady={nightCapturing}
           onLowLight={(e) => setNight({ active: e.nativeEvent.active, seconds: Math.max(1, e.nativeEvent.seconds) })}
-          onZoomChange={(e) => setZoom(e.nativeEvent.zoom)}
+          onZoomChange={(e) => setZoom(Math.round(e.nativeEvent.zoom * 50) / 50)}
           onSwipe={(e) => onSwipe(e.nativeEvent.direction)}
           onShutterButton={onShutter}
           onExposureChange={(e) => setBias(e.nativeEvent.bias)}

@@ -14,7 +14,6 @@ class DualCameraView: ExpoView {
   let onShutterButton = EventDispatcher()
   let onExposureChange = EventDispatcher()
   let onOrientationChange = EventDispatcher()
-  let onDebug = EventDispatcher()
   let onLowLight = EventDispatcher()
 
   // Mode nuit : croix blanche fixe + croix jaune qui bouge avec l'iPhone.
@@ -51,6 +50,7 @@ class DualCameraView: ExpoView {
 
   private let gestureHelper = GestureHelper()
   private var attached = false
+  private var wentToBackground = false
   private var activationScheduled = false
 
   private var dragRect: CGRect?
@@ -113,7 +113,11 @@ class DualCameraView: ExpoView {
       layer.addSublayer(preview)
     }
     DualCameraController.shared.onRuntimeError = { [weak self] message in
-      self?.onCameraError(["message": "La caméra s'est arrêtée : (message)"])
+      self?.onCameraError(["message": message])
+    }
+    DualCameraController.shared.onResume = { [weak self] in
+      guard let self = self, self.attached else { return }
+      self.scheduleActivation()
     }
 
     let yellow = UIColor(red: 1, green: 0.84, blue: 0.04, alpha: 1).cgColor
@@ -170,32 +174,21 @@ class DualCameraView: ExpoView {
     setUpGestures()
     setUpHardwareButtons()
 
-    // Au retour dans l'app, on relance la caméra si iOS l'a arrêtée.
+    // Au retour dans l'app (après un vrai passage en arrière-plan), on relance la caméra.
+    NotificationCenter.default.addObserver(self, selector: #selector(appDidEnterBackground),
+                                           name: UIApplication.didEnterBackgroundNotification, object: nil)
     NotificationCenter.default.addObserver(self, selector: #selector(appDidBecomeActive),
                                            name: UIApplication.didBecomeActiveNotification, object: nil)
   }
 
-  @objc private func appDidBecomeActive() {
-    if attached { scheduleActivation() }
+  @objc private func appDidEnterBackground() {
+    wentToBackground = true
   }
 
-  /// Résumé technique de l'aperçu (diagnostic).
-  private func debugState() -> String {
-    let f = singleLayer.frame
-    var parts = [DualCameraController.shared.debugState(),
-                 "lay=\(Int(f.width))x\(Int(f.height))@\(Int(f.minY))",
-                 "view=\(Int(bounds.width))x\(Int(bounds.height))",
-                 "hid=\(singleLayer.isHidden ? 1 : 0)",
-                 "sub=\(singleLayer.superlayer === layer ? 1 : 0)",
-                 "ses=\(singleLayer.session == nil ? 0 : 1)"]
-    if let connection = singleLayer.connection {
-      parts.append("vc=\(connection.isActive ? 1 : 0)\(connection.isEnabled ? 1 : 0)")
-    } else {
-      parts.append("vc=nil")
-    }
-    parts.append("prev=\(singleLayer.isPreviewing ? 1 : 0)")
-    parts.append("app=\(UIApplication.shared.applicationState.rawValue)")
-    return parts.joined(separator: " ")
+  @objc private func appDidBecomeActive() {
+    guard wentToBackground else { return }
+    wentToBackground = false
+    if attached { scheduleActivation() }
   }
 
   // MARK: - Mise en page
@@ -329,13 +322,7 @@ class DualCameraView: ExpoView {
         self.setNeedsLayout()
         info["mode"] = self.mode
         info["position"] = self.position
-        info["debug"] = self.debugState()
         self.onCameraReady(info)
-        // Deuxième relevé un peu plus tard, quand l'image devrait être là.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-          guard let self = self, self.attached, self.captureMode == requested else { return }
-          self.onDebug(["text": self.debugState()])
-        }
       case .failure(let error):
         self.onCameraError(["message": error.localizedDescription])
       }
