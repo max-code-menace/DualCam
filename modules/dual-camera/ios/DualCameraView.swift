@@ -38,8 +38,14 @@ class DualCameraView: ExpoView {
   private let frontLayer = AVCaptureVideoPreviewLayer()
   private let singleLayer = AVCaptureVideoPreviewLayer()
 
-  // Flou affiché pendant qu'on change de mode ou de caméra (comme l'app Appareil photo).
-  private let blurView = UIVisualEffectView(effect: nil)
+  // Transition entre deux modes ou deux caméras (comme l'app Appareil photo) :
+  // la dernière image reste à l'écran, floue, jusqu'à ce que la nouvelle caméra soit nette.
+  private var transitionHolder: UIView?
+  private var transitionToken = 0
+  private var transitionStart: CFTimeInterval = 0
+  private var transitionFlips = false
+  /// true quand on vient de passer de la caméra arrière à l'avant (ou l'inverse) : l'image se retourne.
+  private var pendingFlip = false
 
   // Carré de mise au point + soleil d'exposition.
   private let focusSquare = CAShapeLayer()
@@ -58,14 +64,18 @@ class DualCameraView: ExpoView {
   private var pinchStartZoom: CGFloat = 1
   private var exposureStart: Float = 0
 
-  /// "dual", "photo" ou "video".
+  /// "dual", "photo", "video" ou "slowmo" (ralenti).
   var mode: String = "photo" {
     didSet { if oldValue != mode { scheduleActivation() } }
   }
 
   /// "back" ou "front" (modes Photo / Vidéo).
   var position: String = "back" {
-    didSet { if oldValue != position { scheduleActivation() } }
+    didSet {
+      guard oldValue != position else { return }
+      if !captureMode.isDual { pendingFlip = true }
+      scheduleActivation()
+    }
   }
 
   /// Vidéo : "HD" ou "4K".
@@ -75,7 +85,7 @@ class DualCameraView: ExpoView {
 
   /// Vidéo : images par seconde (24, 30, 60, 120).
   var videoFps: Int = 30 {
-    didSet { if oldValue != videoFps && mode == "video" { scheduleActivation() } }
+    didSet { if oldValue != videoFps && (mode == "video" || mode == "slowmo") { scheduleActivation() } }
   }
 
   var layout: DualCameraLayout = .stack {
@@ -97,6 +107,7 @@ class DualCameraView: ExpoView {
     switch mode {
     case "dual": return .dual
     case "video": return .video(side)
+    case "slowmo": return .slowmo(side)
     default: return .photo(side)
     }
   }
@@ -165,12 +176,6 @@ class DualCameraView: ExpoView {
       self?.onLowLight(["active": active, "seconds": seconds])
     }
 
-    blurView.isUserInteractionEnabled = false
-    blurView.frame = bounds
-    // Au-dessus des aperçus (y compris la petite fenêtre du mode Duo), sous le carré de mise au point.
-    blurView.layer.zPosition = 5
-    addSubview(blurView)
-
     setUpGestures()
     setUpHardwareButtons()
 
@@ -237,7 +242,7 @@ class DualCameraView: ExpoView {
     backLayer.isHidden = !dual
     frontLayer.isHidden = !dual
     singleLayer.frame = bounds
-    blurView.frame = bounds
+    transitionHolder?.frame = bounds
 
     let c = composition
     let rects = DualCameraGeometry.rects(in: bounds, c)
@@ -303,16 +308,22 @@ class DualCameraView: ExpoView {
   private func activate() {
     guard attached else { return }
     hideFocus(animated: false)
-    setBlur(true)
+    let flip = pendingFlip
+    pendingFlip = false
+    let token = beginTransition(flip: flip)
     applyLayout(animated: false)
     DualCameraController.shared.composition = composition
     DualCameraController.shared.videoHeight = videoResolution == "4K" ? 2160 : 1080
-    DualCameraController.shared.videoFps = videoFps
+    // En Ralenti, `videoFps` vaut 120 ou 240 ; en Vidéo, la vitesse normale.
+    if mode == "slowmo" {
+      DualCameraController.shared.slowMotionFps = videoFps
+    } else {
+      DualCameraController.shared.videoFps = videoFps
+    }
     let requested = captureMode
     DualCameraController.shared.activate(requested, backLayer: backLayer, frontLayer: frontLayer,
                                            singleLayer: singleLayer) { [weak self] result in
       guard let self = self, self.captureMode == requested else { return }
-      self.setBlur(false)
       switch result {
       case .success(var info):
         if !requested.isDual, let connection = self.singleLayer.connection {
@@ -323,7 +334,12 @@ class DualCameraView: ExpoView {
         info["mode"] = self.mode
         info["position"] = self.position
         self.onCameraReady(info)
+        // Le flou part seulement quand la nouvelle caméra a fini sa mise au point.
+        DualCameraController.shared.whenSettled { [weak self] in
+          self?.endTransition(token)
+        }
       case .failure(let error):
+        self.endTransition(token)
         self.onCameraError(["message": error.localizedDescription])
       }
     }
@@ -375,11 +391,80 @@ class DualCameraView: ExpoView {
     CATransaction.commit()
   }
 
-  private func setBlur(_ on: Bool) {
-    UIView.animate(withDuration: on ? 0.15 : 0.4, delay: on ? 0 : 0.12,
-                   options: [.beginFromCurrentState, .curveEaseInOut], animations: {
-      self.blurView.effect = on ? UIBlurEffect(style: .systemUltraThinMaterialDark) : nil
+  // MARK: - Transition entre deux modes
+
+  /// Fige la dernière image et la floute pendant que la caméra change de réglage.
+  /// `flip` : l'image fait un demi-tour (passage caméra arrière ↔ avant). Renvoie un numéro de transition.
+  private func beginTransition(flip: Bool) -> Int {
+    transitionToken += 1
+    transitionStart = CACurrentMediaTime()
+    transitionFlips = flip
+    let old = transitionHolder
+
+    // Fond noir (visible sur les bords pendant le demi-tour), avec une perspective pour l'effet 3D.
+    let holder = UIView(frame: bounds)
+    holder.isUserInteractionEnabled = false
+    holder.backgroundColor = .black
+    holder.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    // Au-dessus des aperçus (y compris la petite fenêtre du mode Duo), sous le carré de mise au point.
+    holder.layer.zPosition = 5
+    var perspective = CATransform3DIdentity
+    perspective.m34 = -1.0 / 900.0
+    holder.layer.sublayerTransform = perspective
+
+    // La « carte » qui se retourne : dernière image de la caméra + flou.
+    let card = UIView(frame: holder.bounds)
+    card.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    card.clipsToBounds = true
+    if let snapshot = snapshotView(afterScreenUpdates: false) {
+      snapshot.frame = card.bounds
+      snapshot.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+      card.addSubview(snapshot)
+    }
+    let blur = UIVisualEffectView(effect: nil)
+    blur.frame = card.bounds
+    blur.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    card.addSubview(blur)
+    holder.addSubview(card)
+    addSubview(holder)
+    transitionHolder = holder
+    old?.removeFromSuperview()
+
+    UIView.animate(withDuration: 0.16, delay: 0, options: [.curveEaseOut], animations: {
+      blur.effect = UIBlurEffect(style: .systemMaterialDark)
     }, completion: nil)
+
+    if flip {
+      // Demi-tour autour de l'axe vertical : 0° → 90°, puis -90° → 0°.
+      UIView.animate(withDuration: 0.2, delay: 0, options: [.curveEaseIn], animations: {
+        card.transform3D = CATransform3DMakeRotation(.pi / 2, 0, 1, 0)
+      }, completion: { _ in
+        card.transform3D = CATransform3DMakeRotation(-.pi / 2, 0, 1, 0)
+        UIView.animate(withDuration: 0.24, delay: 0, options: [.curveEaseOut], animations: {
+          card.transform3D = CATransform3DIdentity
+        }, completion: nil)
+      })
+    }
+    // Sécurité : quoi qu'il arrive, le flou ne reste jamais plus de 3 secondes.
+    let token = transitionToken
+    DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+      self?.endTransition(token)
+    }
+    return token
+  }
+
+  /// Fait disparaître l'image figée en fondu, et montre la caméra en direct.
+  private func endTransition(_ token: Int) {
+    guard token == transitionToken, let holder = transitionHolder else { return }
+    // Le demi-tour doit avoir le temps de se terminer.
+    let minimum: CFTimeInterval = transitionFlips ? 0.46 : 0
+    let wait = max(0, minimum - (CACurrentMediaTime() - transitionStart))
+    transitionHolder = nil
+    UIView.animate(withDuration: 0.3, delay: wait, options: [.curveEaseOut, .beginFromCurrentState], animations: {
+      holder.alpha = 0
+    }, completion: { _ in
+      holder.removeFromSuperview()
+    })
   }
 
   // MARK: - Gestes

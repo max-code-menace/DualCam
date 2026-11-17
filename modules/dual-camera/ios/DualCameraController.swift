@@ -57,13 +57,22 @@ enum CaptureMode: Equatable {
   case dual
   case photo(DualCameraSide)
   case video(DualCameraSide)
+  /// Ralenti : vidéo filmée à 120 ou 240 images par seconde.
+  case slowmo(DualCameraSide)
 
   var isDual: Bool { self == .dual }
-  var isVideo: Bool { if case .video = self { return true } else { return false } }
+  /// true pour tout ce qui filme (Vidéo et Ralenti).
+  var isVideo: Bool {
+    switch self {
+    case .video, .slowmo: return true
+    case .dual, .photo: return false
+    }
+  }
+  var isSlowMotion: Bool { if case .slowmo = self { return true } else { return false } }
   var singleSide: DualCameraSide? {
     switch self {
     case .dual: return nil
-    case .photo(let side), .video(let side): return side
+    case .photo(let side), .video(let side), .slowmo(let side): return side
     }
   }
 }
@@ -167,6 +176,8 @@ final class DualCameraController: NSObject {
   /// Qualité vidéo demandée par l'écran : 1080 (HD) ou 2160 (4K), et images par seconde.
   var videoHeight: Int32 = 1080
   var videoFps: Int = 30
+  /// Ralenti : images par seconde demandées (120 ou 240).
+  var slowMotionFps: Int = 240
   /// Qualité vidéo réellement appliquée.
   private var appliedVideo: (height: Int32, fps: Int) = (1080, 30)
 
@@ -347,7 +358,7 @@ final class DualCameraController: NSObject {
             throw DualCameraError.configurationFailed("la caméra n'a pas démarré.")
           }
           self.observeSubjectArea([self.backDevice, self.frontDevice])
-        case .photo(let side), .video(let side):
+        case .photo(let side), .video(let side), .slowmo(let side):
           if let multi = self.multiSessionStorage {
             if multi.isRunning { multi.stopRunning() }
             backLayer.session = nil
@@ -357,11 +368,15 @@ final class DualCameraController: NSObject {
             self.backDevice = nil
             self.frontDevice = nil
           }
-          try self.configureSingle(side: side, video: newMode.isVideo)
+          try self.configureSingle(side: side, video: newMode.isVideo, slowMotion: newMode.isSlowMotion)
           // L'aperçu est branché maintenant que la caméra est dans la session.
           try self.connectPreview(singleLayer)
           // Changer de qualité remet le zoom à zéro : on revient à 1× une fois la configuration finie.
           if let device = self.singleDevice { self.setInitialZoom(device) }
+          // Ralenti : on confirme la vitesse une fois la session réglée (iOS peut la remettre à zéro).
+          if newMode.isSlowMotion, let device = self.singleDevice {
+            self.lockFrameRate(device, fps: self.appliedVideo.fps)
+          }
           if !self.singleSession.isRunning { self.singleSession.startRunning() }
           guard self.singleSession.isRunning else {
             throw DualCameraError.configurationFailed("la caméra n'a pas démarré.")
@@ -376,6 +391,28 @@ final class DualCameraController: NSObject {
         DispatchQueue.main.async { completion(.failure(error)) }
       }
     }
+  }
+
+  /// Appelle `done` (fil principal) quand la caméra a fini sa mise au point et son exposition,
+  /// pour que l'écran passe directement à une image nette (0,6 seconde d'attente au plus).
+  func whenSettled(_ done: @escaping () -> Void) {
+    let start = CACurrentMediaTime()
+    func check() {
+      let elapsed = CACurrentMediaTime() - start
+      let devices: [AVCaptureDevice]
+      if self.mode == .dual {
+        devices = [self.backDevice, self.frontDevice].compactMap { $0 }
+      } else {
+        devices = [self.singleDevice].compactMap { $0 }
+      }
+      let busy = devices.contains { $0.isAdjustingFocus || $0.isAdjustingExposure }
+      if elapsed >= 0.6 || (elapsed >= 0.12 && !busy) {
+        DispatchQueue.main.async(execute: done)
+        return
+      }
+      self.sessionQueue.asyncAfter(deadline: .now() + 0.04) { check() }
+    }
+    sessionQueue.async { check() }
   }
 
   func stop() {
@@ -400,15 +437,20 @@ final class DualCameraController: NSObject {
       hasFlash = singlePhotoOutput.supportedFlashModes.contains(.on)
       liveSupported = singlePhotoOutput.isLivePhotoCaptureEnabled
       resolutions = availableMegapixels()
-    case .video?:
+    case .video?, .slowmo?:
       hasFlash = singleDevice?.hasTorch ?? false
     case nil:
       break
     }
     let biasDevice = device(for: focusedSide)
-    let isVideo = mode?.isVideo ?? false
+    var options: [[String: Any]] = []
+    if case .slowmo(let side)? = mode {
+      options = slowMotionOptions(for: side)
+    } else if mode?.isVideo == true {
+      options = videoOptions()
+    }
     return [
-      "videoOptions": isVideo ? videoOptions() : [],
+      "videoOptions": options,
       "videoResolution": appliedVideo.height == 2160 ? "4K" : "HD",
       "videoFps": appliedVideo.fps,
       "hasUltraWide": range.min < 0.99,
@@ -591,10 +633,16 @@ final class DualCameraController: NSObject {
     return nil
   }
 
-  private func configureSingle(side: DualCameraSide, video: Bool) throws {
+  private func configureSingle(side: DualCameraSide, video: Bool, slowMotion: Bool) throws {
     let session = singleSession
     let label = side == .front ? "avant" : "arrière"
-    guard let device = bestDevice(for: side) else {
+    let found = slowMotion
+      ? (slowMotionDevice(for: side, fps: slowMotionFps) ?? slowMotionDevice(for: side, fps: 120))
+      : bestDevice(for: side)
+    guard let device = found else {
+      if slowMotion {
+        throw DualCameraError.configurationFailed("le ralenti n'est pas disponible sur la caméra \(label).")
+      }
       throw DualCameraError.cameraUnavailable(label)
     }
 
@@ -625,7 +673,21 @@ final class DualCameraController: NSObject {
     }
 
     // Qualité : photo pleine résolution, ou vidéo au format choisi (HD / 4K, images par seconde)
-    if video {
+    if slowMotion {
+      // Ralenti : 240 images par seconde si possible, sinon 120.
+      var fps = slowMotionFps
+      if slowMotionFormat(for: device, fps: fps) == nil { fps = 120 }
+      guard let format = slowMotionFormat(for: device, fps: fps) else {
+        throw DualCameraError.configurationFailed("le ralenti n'est pas disponible sur la caméra \(label).")
+      }
+      try device.lockForConfiguration()
+      device.activeFormat = format
+      let duration = CMTime(value: 1, timescale: CMTimeScale(fps))
+      device.activeVideoMinFrameDuration = duration
+      device.activeVideoMaxFrameDuration = duration
+      device.unlockForConfiguration()
+      appliedVideo = (CMVideoFormatDescriptionGetDimensions(format.formatDescription).height, fps)
+    } else if video {
       var height = videoHeight
       var fps = videoFps
       var format = videoFormat(for: device, height: height, fps: fps)
@@ -653,8 +715,10 @@ final class DualCameraController: NSObject {
       session.sessionPreset = .photo
     }
 
-    // Sortie photo (toujours là)
-    if !session.outputs.contains(singlePhotoOutput) {
+    // Sortie photo (Photo et Vidéo). Pas en Ralenti : elle pourrait limiter la vitesse de la caméra.
+    if slowMotion {
+      if session.outputs.contains(singlePhotoOutput) { session.removeOutput(singlePhotoOutput) }
+    } else if !session.outputs.contains(singlePhotoOutput) {
       guard session.canAddOutput(singlePhotoOutput) else {
         throw DualCameraError.configurationFailed("sortie photo refusée.")
       }
@@ -686,25 +750,27 @@ final class DualCameraController: NSObject {
     }
 
     // Réglages de la sortie photo
-    singlePhotoOutput.isLivePhotoCaptureEnabled = !video && singlePhotoOutput.isLivePhotoCaptureSupported
-    singlePhotoOutput.maxPhotoQualityPrioritization = .quality
-    if let biggest = device.activeFormat.supportedMaxPhotoDimensions.max(by: { area($0) < area($1) }) {
-      singlePhotoOutput.maxPhotoDimensions = biggest
-    }
-    // Ultra grand-angle (0,5×) : iOS redresse les bords déformés, comme l'app Appareil photo.
-    if singlePhotoOutput.isContentAwareDistortionCorrectionSupported {
-      singlePhotoOutput.isContentAwareDistortionCorrectionEnabled = true
-    }
-    // Déclenchement instantané, et photos enchaînées sans attendre la précédente.
-    if #available(iOS 17.0, *) {
-      if singlePhotoOutput.isZeroShutterLagSupported {
-        singlePhotoOutput.isZeroShutterLagEnabled = true
+    if session.outputs.contains(singlePhotoOutput) {
+      singlePhotoOutput.isLivePhotoCaptureEnabled = !video && singlePhotoOutput.isLivePhotoCaptureSupported
+      singlePhotoOutput.maxPhotoQualityPrioritization = .quality
+      if let biggest = device.activeFormat.supportedMaxPhotoDimensions.max(by: { area($0) < area($1) }) {
+        singlePhotoOutput.maxPhotoDimensions = biggest
       }
-      if singlePhotoOutput.isResponsiveCaptureSupported {
-        singlePhotoOutput.isResponsiveCaptureEnabled = true
+      // Ultra grand-angle (0,5×) : iOS redresse les bords déformés, comme l'app Appareil photo.
+      if singlePhotoOutput.isContentAwareDistortionCorrectionSupported {
+        singlePhotoOutput.isContentAwareDistortionCorrectionEnabled = true
       }
-      if singlePhotoOutput.isFastCapturePrioritizationSupported {
-        singlePhotoOutput.isFastCapturePrioritizationEnabled = true
+      // Déclenchement instantané, et photos enchaînées sans attendre la précédente.
+      if #available(iOS 17.0, *) {
+        if singlePhotoOutput.isZeroShutterLagSupported {
+          singlePhotoOutput.isZeroShutterLagEnabled = true
+        }
+        if singlePhotoOutput.isResponsiveCaptureSupported {
+          singlePhotoOutput.isResponsiveCaptureEnabled = true
+        }
+        if singlePhotoOutput.isFastCapturePrioritizationSupported {
+          singlePhotoOutput.isFastCapturePrioritizationEnabled = true
+        }
       }
     }
 
@@ -832,6 +898,60 @@ final class DualCameraController: NSObject {
     return result
   }
 
+  // MARK: - Ralenti
+
+  /// Format du ralenti : 1080p (sinon 720p) capable de filmer à `fps` images par seconde.
+  private func slowMotionFormat(for device: AVCaptureDevice, fps: Int) -> AVCaptureDevice.Format? {
+    let wanted = Double(fps)
+    let candidates = device.formats.filter { format in
+      let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+      let sizeOK = (dims.width == 1920 && dims.height == 1080) || (dims.width == 1280 && dims.height == 720)
+      guard sizeOK else { return false }
+      return format.videoSupportedFrameRateRanges.contains { $0.minFrameRate <= wanted && wanted <= $0.maxFrameRate }
+    }
+    // On préfère la plus grande taille, puis le format vidéo standard (8 bits).
+    func score(_ format: AVCaptureDevice.Format) -> (Int, Int) {
+      let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+      let subType = CMFormatDescriptionGetMediaSubType(format.formatDescription)
+      let standard = subType == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ? 1 : 0
+      return (Int(dims.height), standard)
+    }
+    return candidates.max(by: { score($0) < score($1) })
+  }
+
+  /// Caméra qui sait filmer en ralenti à `fps` : la caméra habituelle si possible,
+  /// sinon la grand-angle seule (certains iPhone ne proposent le 240 que sur elle).
+  private func slowMotionDevice(for side: DualCameraSide, fps: Int) -> AVCaptureDevice? {
+    var devices: [AVCaptureDevice] = []
+    if let best = bestDevice(for: side) { devices.append(best) }
+    if let wide = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: side.position) {
+      devices.append(wide)
+    }
+    return devices.first { slowMotionFormat(for: $0, fps: fps) != nil }
+  }
+
+  /// Choix proposés à l'écran pour le ralenti (120 et/ou 240).
+  private func slowMotionOptions(for side: DualCameraSide) -> [[String: Any]] {
+    let rates = [120, 240].filter { slowMotionDevice(for: side, fps: $0) != nil }
+    if rates.isEmpty { return [] }
+    return [["resolution": "HD", "fps": rates]]
+  }
+
+  /// Fixe la vitesse de la caméra (images par seconde).
+  private func lockFrameRate(_ device: AVCaptureDevice, fps: Int) {
+    let wanted = Double(fps)
+    guard device.activeFormat.videoSupportedFrameRateRanges.contains(where: {
+      $0.minFrameRate <= wanted && wanted <= $0.maxFrameRate
+    }) else { return }
+    do {
+      try device.lockForConfiguration()
+      let duration = CMTime(value: 1, timescale: CMTimeScale(fps))
+      device.activeVideoMinFrameDuration = duration
+      device.activeVideoMaxFrameDuration = duration
+      device.unlockForConfiguration()
+    } catch {}
+  }
+
   /// Relie l'aperçu des modes Photo / Vidéo à la caméra (et vérifie que c'est bien fait).
   private func connectPreview(_ previewLayer: AVCaptureVideoPreviewLayer) throws {
     let session = singleSession
@@ -899,7 +1019,7 @@ final class DualCameraController: NSObject {
     switch mode {
     case .dual?:
       return side == .back ? backDevice : frontDevice
-    case .photo(let current)?, .video(let current)?:
+    case .photo(let current)?, .video(let current)?, .slowmo(let current)?:
       return current == side ? singleDevice : nil
     case nil:
       return nil
@@ -1051,7 +1171,7 @@ final class DualCameraController: NSObject {
           return
         }
         self.takeSinglePhoto(request, completion: completion)
-      case .video:
+      case .video, .slowmo:
         completion(.failure(DualCameraError.captureFailed("passez en mode Photo.")))
       }
     }
@@ -1263,7 +1383,7 @@ final class DualCameraController: NSObject {
   /// Démarre l'enregistrement. `completion` est appelé quand la vidéo a vraiment commencé.
   func startRecording(torch: Bool, completion: @escaping (Error?) -> Void) {
     sessionQueue.async {
-      guard case .video? = self.mode, self.singleSession.isRunning else {
+      guard self.mode?.isVideo == true, self.singleSession.isRunning else {
         completion(DualCameraError.notRunning)
         return
       }

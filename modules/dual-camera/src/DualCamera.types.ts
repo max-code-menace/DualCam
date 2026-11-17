@@ -3,8 +3,8 @@ import type { StyleProp, ViewStyle } from 'react-native';
 /** "stack" = haut / bas. "side" = côte à côte. "pip" = une caméra en petite incrustation sur l'autre. */
 export type DualCameraLayout = 'stack' | 'side' | 'pip';
 
-/** "photo" et "video" = une seule caméra (pleine qualité). "dual" = les deux en même temps. */
-export type CaptureModeName = 'photo' | 'video' | 'dual';
+/** "photo", "video" et "slowmo" (ralenti) = une seule caméra (pleine qualité). "dual" = les deux en même temps. */
+export type CaptureModeName = 'photo' | 'video' | 'slowmo' | 'dual';
 
 export type DualCameraSide = 'back' | 'front';
 
@@ -64,7 +64,7 @@ export type DualCameraViewProps = {
   swapped?: boolean;
   /** Mode Vidéo : "HD" ou "4K". */
   videoResolution?: VideoResolution;
-  /** Mode Vidéo : images par seconde. */
+  /** Mode Vidéo : images par seconde. Mode Ralenti : 120 ou 240. */
   videoFps?: number;
   onCameraReady?: (event: { nativeEvent: CameraReadyEvent }) => void;
   onCameraError?: (event: { nativeEvent: { message: string } }) => void;

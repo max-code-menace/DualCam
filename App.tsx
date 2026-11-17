@@ -2,7 +2,7 @@ import { StatusBar } from 'expo-status-bar';
 import { GlassView, isLiquidGlassAvailable } from 'expo-glass-effect';
 import { SymbolView } from 'expo-symbols';
 import type { SFSymbol } from 'sf-symbols-typescript';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Animated,
@@ -167,6 +167,7 @@ function WelcomeRow({ icon, title, text, state }: { icon: SFSymbol; title: strin
 // Petits outils
 // ─────────────────────────────────────────────────────────────
 const MODES: { key: CaptureModeName; label: string }[] = [
+  { key: 'slowmo', label: 'RALENTI' },
   { key: 'video', label: 'VIDÉO' },
   { key: 'photo', label: 'PHOTO' },
   { key: 'dual', label: 'DUO' },
@@ -186,6 +187,7 @@ const SIDE_MARGIN = 34;
 const ROUND = 48;
 const SHUTTER = 79;
 const SHUTTER_INNER = 67;
+const PANEL_HEIGHT = 182;
 
 /** 1.4 → « 1,4 » */
 function formatNumber(value: number) {
@@ -249,6 +251,8 @@ function CameraScreen() {
   // Vidéo : qualité choisie.
   const [videoRes, setVideoRes] = useState<VideoResolution>('HD');
   const [videoFps, setVideoFps] = useState(30);
+  // Ralenti : 240 images par seconde si l'iPhone le permet, sinon 120.
+  const [slowFps, setSlowFps] = useState(240);
   const [formatOpen, setFormatOpen] = useState(false);
   // Mode nuit : proposé par l'iPhone quand il fait sombre, on peut le couper en touchant la lune.
   const [night, setNight] = useState({ active: false, seconds: 1 });
@@ -273,6 +277,8 @@ function CameraScreen() {
   const ready = info !== null && info.mode === mode;
   const modeIndex = MODES.findIndex((m) => m.key === mode);
   const zoomSide: DualCameraSide = mode === 'dual' ? 'back' : position;
+  // Vidéo et Ralenti filment : déclencheur rouge, lampe, image 16:9.
+  const isMovie = mode === 'video' || mode === 'slowmo';
 
   // Résolution réellement utilisée (la caméra avant ne fait que 12 Mpx).
   const resolutionList = info?.resolutions?.length ? info.resolutions : [12];
@@ -296,7 +302,7 @@ function CameraScreen() {
   const area43 = (screenWidth * 4) / 3;
   let previewTop = areaTop;
   let previewHeight = area43;
-  if (mode === 'video' || (mode === 'photo' && aspect === '16:9')) {
+  if (isMovie || (mode === 'photo' && aspect === '16:9')) {
     previewHeight = (screenWidth * 16) / 9;
     previewTop = Math.max(0, Math.min(insets.top - 4, screenHeight - previewHeight));
   } else if (mode === 'photo' && aspect === '1:1') {
@@ -317,12 +323,13 @@ function CameraScreen() {
 
   // Panneau FORMAT : les boutons montent et la rangée du bas s'efface.
   const lift = useRef(new Animated.Value(0)).current;
-  const formatVisible = formatOpen && mode === 'video' && !recording;
+  const formatVisible = formatOpen && isMovie && !recording;
   useEffect(() => {
-    Animated.timing(lift, {
+    // Le panneau sort de la roulette des modes en rebondissant un peu, puis y rentre.
+    Animated.spring(lift, {
       toValue: formatVisible ? 1 : 0,
-      duration: 280,
-      easing: Easing.inOut(Easing.cubic),
+      friction: formatVisible ? 8.5 : 11,
+      tension: formatVisible ? 70 : 95,
       useNativeDriver: true,
     }).start();
   }, [formatVisible, lift]);
@@ -474,17 +481,20 @@ function CameraScreen() {
 
   // Vidéo : toucher « HD » change la taille, toucher « 30 » change les images par seconde.
   const videoOptions = info?.videoOptions ?? [];
-  const currentVideoOption = videoOptions.find((o) => o.resolution === videoRes);
+  const panelRes: VideoResolution = mode === 'slowmo' ? 'HD' : videoRes;
+  const panelFps = mode === 'slowmo' ? slowFps : videoFps;
+  const currentVideoOption = videoOptions.find((o) => o.resolution === panelRes);
   const pickVideoResolution = (next: VideoOption) => {
-    if (recording || next.resolution === videoRes) return;
+    if (recording || mode === 'slowmo' || next.resolution === videoRes) return;
     DualCamera.haptic('selection');
     setVideoRes(next.resolution);
     if (!next.fps.includes(videoFps)) setVideoFps(next.fps.includes(30) ? 30 : next.fps[0]);
   };
   const pickVideoFps = (fps: number) => {
-    if (recording || fps === videoFps) return;
+    if (recording || fps === panelFps) return;
     DualCamera.haptic('selection');
-    setVideoFps(fps);
+    if (mode === 'slowmo') setSlowFps(fps);
+    else setVideoFps(fps);
   };
 
   const nextLayout = () => {
@@ -561,7 +571,7 @@ function CameraScreen() {
     setCountdown(null);
   };
 
-  const fire = () => (mode === 'video' ? toggleRecording() : capturePhoto());
+  const fire = () => (isMovie ? toggleRecording() : capturePhoto());
 
   const onShutter = () => {
     if (!ready || nightCapturing) return;
@@ -569,7 +579,7 @@ function CameraScreen() {
       cancelCountdown();
       return;
     }
-    if (busy && mode === 'video') return;
+    if (busy && isMovie) return;
     DualCamera.haptic('medium');
     // Le retardateur ne s'applique pas pour arrêter une vidéo.
     if (timer === 0 || recording) {
@@ -594,9 +604,9 @@ function CameraScreen() {
   const presets = useMemo(() => {
     // Caméra avant : un seul bouton, comme l'app Appareil photo.
     if (!info || zoomSide === 'front') return [1];
-    const list = [info.hasUltraWide ? 0.5 : null, 1, info.maxZoom >= 2 ? 2 : null];
+    const list = [info.hasUltraWide ? 0.5 : null, 1, info.maxZoom >= 2 && mode !== 'slowmo' ? 2 : null];
     return list.filter((v): v is number => v !== null);
-  }, [info, zoomSide]);
+  }, [info, zoomSide, mode]);
   const activePreset = zoom < 0.95 ? 0.5 : zoom < 1.95 ? 1 : 2;
 
   const applyZoom = (value: number, animated: boolean) => {
@@ -655,7 +665,7 @@ function CameraScreen() {
   // ── Panneau de réglages ──
   type Control = { key: string; label: string; icon?: SFSymbol; text?: string; active?: boolean; onPress: () => void };
   const controls: Control[] = [];
-  if (mode === 'video') {
+  if (isMovie) {
     controls.push({
       key: 'torch',
       label: 'FLASH',
@@ -740,12 +750,14 @@ function CameraScreen() {
           layout={layout}
           swapped={swapped}
           videoResolution={videoRes}
-          videoFps={videoFps}
+          videoFps={mode === 'slowmo' ? slowFps : videoFps}
           onCameraReady={(e) => {
             setInfo(e.nativeEvent);
             if (e.nativeEvent.mode === 'video') {
               if (e.nativeEvent.videoResolution) setVideoRes(e.nativeEvent.videoResolution);
               if (e.nativeEvent.videoFps) setVideoFps(e.nativeEvent.videoFps);
+            } else if (e.nativeEvent.mode === 'slowmo' && e.nativeEvent.videoFps) {
+              setSlowFps(e.nativeEvent.videoFps);
             }
             setZoom(e.nativeEvent.zoom);
             setError(null);
@@ -788,7 +800,7 @@ function CameraScreen() {
           </View>
         ) : (
           <View style={styles.topIcons}>
-            {mode === 'video' ? (
+            {isMovie ? (
               <>
                 <Pressable hitSlop={10} onPress={() => setTorch((t) => !t)}>
                   <Animated.View style={rotate}>
@@ -803,8 +815,8 @@ function CameraScreen() {
                   }}
                 >
                   <Animated.View style={[styles.hdBox, rotate]}>
-                    <Text style={styles.hdText}>{videoRes}</Text>
-                    <Text style={styles.hdSub}>{videoFps}</Text>
+                    <Text style={styles.hdText}>{panelRes}</Text>
+                    <Text style={styles.hdSub}>{panelFps}</Text>
                   </Animated.View>
                 </Pressable>
               </>
@@ -926,12 +938,13 @@ function CameraScreen() {
           disabled={!ready}
           onPressIn={() => Animated.spring(shutterScale, { toValue: 0.9, useNativeDriver: true }).start()}
           onPressOut={() => Animated.spring(shutterScale, { toValue: 1, friction: 4, useNativeDriver: true }).start()}
-          style={styles.shutterOuter}
+          style={[styles.shutterOuter, mode === 'slowmo' && styles.shutterOuterTicks]}
         >
+          {mode === 'slowmo' && <TickRing count={100} size={SHUTTER} length={4.5} />}
           <Animated.View
             style={[
               styles.shutterInner,
-              mode === 'video' && { backgroundColor: RED },
+              isMovie && { backgroundColor: RED },
               (recording || countdown !== null) && styles.shutterInnerStop,
               nightCapturing && { backgroundColor: '#8e8e93' },
               { transform: [{ scale: shutterScale }] },
@@ -998,7 +1011,11 @@ function CameraScreen() {
           </Animated.View>
         </View>
 
-        <Pressable style={styles.roundButton} onPress={onFlip} disabled={recording}>
+        <Pressable
+          style={({ pressed }) => [styles.roundButton, pressed && styles.roundButtonPressed]}
+          onPress={onFlip}
+          disabled={recording}
+        >
               <Glass width={ROUND} height={ROUND} radius={ROUND / 2} />
           <Animated.View style={rotate}>
             <Animated.View
@@ -1012,19 +1029,36 @@ function CameraScreen() {
         </Pressable>
       </Animated.View>
 
-      {/* Panneau FORMAT du mode Vidéo */}
+      {/* Panneau FORMAT des modes Vidéo et Ralenti */}
       <Animated.View
         pointerEvents={formatVisible ? 'auto' : 'none'}
         style={[
           styles.formatPanel,
           {
             bottom: base,
-            opacity: lift,
-            transform: [{ translateY: lift.interpolate({ inputRange: [0, 1], outputRange: [60, 0] }) }],
+            opacity: lift.interpolate({ inputRange: [0, 0.2], outputRange: [0, 1], extrapolate: 'clamp' }),
+            transform: [
+              // Au départ, le panneau a la taille et la place de la roulette des modes.
+              { translateY: lift.interpolate({ inputRange: [0, 1], outputRange: [(PANEL_HEIGHT - ROUND) / 2, 0] }) },
+              {
+                scaleX: lift.interpolate({
+                  inputRange: [0, 1],
+                  outputRange: [Math.min(1, capsuleWidth / (screenWidth - 18)), 1],
+                }),
+              },
+              { scaleY: lift.interpolate({ inputRange: [0, 1], outputRange: [ROUND / PANEL_HEIGHT, 1] }) },
+            ],
           },
         ]}
       >
-        <Glass width={screenWidth - 18} height={182} radius={40} />
+        <Glass width={screenWidth - 18} height={PANEL_HEIGHT} radius={40} />
+        <Animated.View
+          pointerEvents="box-none"
+          style={[
+            StyleSheet.absoluteFill,
+            { opacity: lift.interpolate({ inputRange: [0.45, 0.9], outputRange: [0, 1], extrapolate: 'clamp' }) },
+          ]}
+        >
         <Text style={styles.formatTitle}>FORMAT</Text>
         <Pressable style={styles.formatClose} hitSlop={8} onPress={() => setFormatOpen(false)}>
           <Icon name="xmark" size={15} />
@@ -1032,7 +1066,7 @@ function CameraScreen() {
         <View style={[styles.formatRow, { top: 68 }]}>
           <Text style={styles.formatLabel}>RÉSOLUTION</Text>
           {videoOptions.map((o) => {
-            const selected = o.resolution === videoRes;
+            const selected = o.resolution === panelRes;
             return (
               <Pressable key={o.resolution} style={styles.formatOption} onPress={() => pickVideoResolution(o)}>
                 {selected && <View style={styles.formatDot} />}
@@ -1044,7 +1078,7 @@ function CameraScreen() {
         <View style={[styles.formatRow, { top: 112 }]}>
           <Text style={styles.formatLabel}>IPS</Text>
           {(currentVideoOption?.fps ?? []).map((fps) => {
-            const selected = fps === videoFps;
+            const selected = fps === panelFps;
             return (
               <Pressable key={fps} style={styles.formatOption} onPress={() => pickVideoFps(fps)}>
                 {selected && <View style={styles.formatDot} />}
@@ -1053,6 +1087,7 @@ function CameraScreen() {
             );
           })}
         </View>
+        </Animated.View>
       </Animated.View>
 
       {/* Panneau de réglages */}
@@ -1085,6 +1120,22 @@ function CameraScreen() {
     </View>
   );
 }
+
+/** Anneau de petits traits autour du déclencheur (mode Ralenti), comme l'app Appareil photo. */
+const TickRing = memo(function TickRing({ count, size, length }: { count: number; size: number; length: number }) {
+  return (
+    <View pointerEvents="none" style={{ position: 'absolute', left: 0, top: 0, width: size, height: size }}>
+      {Array.from({ length: count }, (_, i) => (
+        <View
+          key={i}
+          style={[StyleSheet.absoluteFill, { alignItems: 'center', transform: [{ rotate: ((360 * i) / count) + 'deg' }] }]}
+        >
+          <View style={{ width: 1.2, height: length, borderRadius: 0.6, backgroundColor: '#fff' }} />
+        </View>
+      ))}
+    </View>
+  );
+});
 
 /** Icône « six points » du bouton de réglages, comme l'app Appareil photo. */
 function DotsGrid() {
@@ -1213,9 +1264,11 @@ const styles = StyleSheet.create({
   // Déclencheur
   shutterRow: { position: 'absolute', left: 0, right: 0, height: 80, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: SIDE_MARGIN },
   roundSlot: { width: ROUND, height: ROUND },
+  roundButtonPressed: { backgroundColor: 'rgba(255,255,255,0.3)' },
   roundButton: { width: ROUND, height: ROUND, borderRadius: ROUND / 2, backgroundColor: BUTTON_BG, alignItems: 'center', justifyContent: 'center' },
   roundButtonText: { color: '#fff', fontSize: 13, fontWeight: '600' },
   shutterOuter: { width: SHUTTER, height: SHUTTER, borderRadius: SHUTTER / 2, backgroundColor: '#2b2b2d', borderWidth: StyleSheet.hairlineWidth, borderColor: 'rgba(255,255,255,0.18)', alignItems: 'center', justifyContent: 'center' },
+  shutterOuterTicks: { backgroundColor: 'transparent', borderWidth: 0 },
   shutterInner: { width: SHUTTER_INNER, height: SHUTTER_INNER, borderRadius: SHUTTER_INNER / 2, backgroundColor: '#fff' },
   shutterInnerStop: { backgroundColor: RED, width: 30, height: 30, borderRadius: 7 },
 
@@ -1234,7 +1287,7 @@ const styles = StyleSheet.create({
   modeTextActive: { color: YELLOW },
 
   // Panneau FORMAT (mesures relevées sur l'app Appareil photo)
-  formatPanel: { position: 'absolute', left: 9, right: 9, height: 182, borderRadius: 40, backgroundColor: PANEL_BG, overflow: 'hidden', borderWidth: StyleSheet.hairlineWidth, borderColor: 'rgba(255,255,255,0.16)' },
+  formatPanel: { position: 'absolute', left: 9, right: 9, height: PANEL_HEIGHT, borderRadius: 40, backgroundColor: PANEL_BG, overflow: 'hidden', borderWidth: StyleSheet.hairlineWidth, borderColor: 'rgba(255,255,255,0.16)' },
   formatTitle: { position: 'absolute', top: 20, left: 0, right: 0, textAlign: 'center', color: '#fff', fontSize: 13.5, lineHeight: 16, fontWeight: '400', letterSpacing: 1.6 },
   formatClose: { position: 'absolute', left: 24, top: 25, width: 36, height: 36, borderRadius: 18, backgroundColor: 'rgba(255,255,255,0.08)', alignItems: 'center', justifyContent: 'center' },
   formatRow: { position: 'absolute', left: 50, right: 0, height: 30, flexDirection: 'row', alignItems: 'center' },
